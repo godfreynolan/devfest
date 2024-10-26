@@ -14,11 +14,16 @@ import config
 app = Flask(__name__)
 
 class PDFRAG:
-    def __init__(self, data_dir: str, google_api_key: str):
+    def __init__(self, data_dir: str, google_api_key: str, index_path: str = "faiss_index"):
         self.data_dir = data_dir
+        self.index_path = index_path
         os.environ["GOOGLE_API_KEY"] = google_api_key
-        self.documents = self.load_documents()
-        self.vector_store = self.create_vector_store()
+        self.embeddings = GoogleGenerativeAIEmbeddings(
+            model="models/embedding-001",
+            task_type="retrieval_document",
+            google_api_key=google_api_key
+        )
+        self.vector_store = self.load_or_create_vector_store()
         self.qa_chain = self.setup_qa_chain()
 
     def load_documents(self) -> List:
@@ -31,19 +36,47 @@ class PDFRAG:
                 documents.extend(loader.load())
         return documents
 
-    def create_vector_store(self):
-        print("Creating vector store...")
-        text_splitter = \
-        RecursiveCharacterTextSplitter(chunk_size=1000,\
-                                       chunk_overlap=200)
-        texts = text_splitter.split_documents(self.documents)
+    def load_or_create_vector_store(self):
+        # Try to load existing index
+        if os.path.exists(self.index_path):
+            print("Loading existing vector store...")
+            return FAISS.load_local(
+                self.index_path,
+                self.embeddings
+            )
         
-        embeddings = GoogleGenerativeAIEmbeddings(
-            model="models/embedding-001",
-            task_type="retrieval_document",
-            google_api_key=os.getenv("GOOGLE_API_KEY")
+        # Create new index if none exists
+        print("Creating new vector store...")
+        documents = self.load_documents()
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200
         )
-        return FAISS.from_documents(texts, embeddings)
+        texts = text_splitter.split_documents(documents)
+        
+        vector_store = FAISS.from_documents(texts, self.embeddings)
+        
+        # Save the index
+        print("Saving vector store...")
+        vector_store.save_local(self.index_path)
+        
+        return vector_store
+
+    def update_vector_store(self):
+        """Method to update the vector store with new documents"""
+        documents = self.load_documents()
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200
+        )
+        texts = text_splitter.split_documents(documents)
+        
+        # Add new documents to existing index
+        self.vector_store.add_documents(texts)
+        
+        # Save updated index
+        self.vector_store.save_local(self.index_path)
+        print("Vector store updated and saved.")
 
     def setup_qa_chain(self):
         print("Setting up QA chain...")
@@ -53,44 +86,35 @@ class PDFRAG:
             google_api_key=os.getenv("GOOGLE_API_KEY")
         )
         
-        # Define the prompt template
-        template = """Use the following pieces of \
-            context to answer the question at the \
-            end. If you don't know the answer, \
-            just say that you don't know, don't \
-                try to make up an answer.
+        template = """Use the following pieces of context to answer the question at the end. 
+        If you don't know the answer, just say that you don't know, don't try to make up an answer.
         
         Context: {context}
         Question: {question}
         
         Answer:"""
         
-        # Create the retriever
         retriever = self.vector_store.as_retriever(
             search_type="similarity",
             search_kwargs={"k": 3}
         )
         
-        self.qa_chain = (
+        qa_chain = (
             {"context": retriever, "question": RunnablePassthrough()}
             | PromptTemplate.from_template(template)
             | llm
         )
         
-        return self.qa_chain
+        return qa_chain
 
     def query(self, question: str) -> tuple:
         print("Processing query...")
-        # Get documents for the question
         retriever = self.vector_store.as_retriever(
             search_type="similarity",
             search_kwargs={"k": 3}
         )
         docs = retriever.get_relevant_documents(question)
-        
-        # Get the answer
         answer = self.qa_chain.invoke(question)
-        
         return answer.content, docs
 
     def display_relevant_docs(self, docs, num_docs=3):
@@ -101,26 +125,33 @@ class PDFRAG:
             print(f"Source: {doc.metadata.get('source', 'Unknown')}")
 
 
+# Create a global RAG instance
+data_dir = "data"
+google_api_key = config.GOOGLE_API_KEY
+rag_instance = None
+
+def get_rag_instance():
+    global rag_instance
+    if rag_instance is None:
+        rag_instance = PDFRAG(data_dir, google_api_key)
+    return rag_instance
+
 @app.route("/")
 def index():
     return render_template("index.html")
 
-
 @app.route("/get")
 def get_bot_response():
-    data_dir = "data"
-    google_api_key = config.GOOGLE_API_KEY
-    
-    rag = PDFRAG(data_dir, google_api_key)
-    
-    while True:
-        user_question = request.args.get('msg')
-        answer, source_docs = rag.query(user_question)
-        print("\nAnswer:", answer)
-        # rag.display_relevant_docs(source_docs)
-        # print("\n" + "-"*50)
-        return answer
+    rag = get_rag_instance()
+    user_question = request.args.get('msg')
+    answer, source_docs = rag.query(user_question)
+    return answer
 
+@app.route("/update_index")
+def update_index():
+    rag = get_rag_instance()
+    rag.update_vector_store()
+    return "Vector store updated successfully!"
 
 if __name__ == "__main__":
     app.run()
